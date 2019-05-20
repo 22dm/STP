@@ -1,180 +1,138 @@
 /*
  *   Simple Transport Protocol Sender
  *
- *   sjysd(Tentative)  2019/05/10
+ *   sjysd(Tentative)  2019/05/20
  *
  */
 
 #include "STP.c"
 
-int main(int argc, char *argv[]) {
+int main(int argc, char *argv[])
+{
+	//判断参数个数
+	if (argc != 12) {
+		printf("Usage: ./sender file ip port pDrop seedDrop maxDelay "
+		       "pDelay seedDelay MSS MWS/MSS initalTimeout");
+		return -1;
+	}
 
-    //判断参数个数
-    if (argc != 12) {
-        printf("Usage: ./sender file ip port pDrop seedDrop maxDelay pDelay seedDelay MSS MWS/MSS initalTimeout");
-        return -1;
-    }
+	//读取参数
+	const char *file = argv[1];
+	const char *ip = argv[2];
+	int port = (int)strtol(argv[3], NULL, 10);
+	pDrop = (float)strtod(argv[4], NULL);
+	seedDrop = (int)strtol(argv[5], NULL, 10);
+	maxDelay = (int)strtol(argv[6], NULL, 10);
+	pDelay = (float)strtod(argv[7], NULL);
+	seedDelay = (int)strtol(argv[8], NULL, 10);
+	int MSS = (int)strtol(argv[9], NULL, 10);
+	int window = (int)strtol(argv[10], NULL, 10);
+	int timeout = (int)strtol(argv[11], NULL, 10);
 
-    //读取参数
-    const char *file = argv[1];
-    const char *ip = argv[2];
-    int port = (int) strtol(argv[3], NULL, 10);
-    pDrop = (float) strtod(argv[4], NULL);
-    seedDrop = (int) strtol(argv[5], NULL, 10);
-    maxDelay = (int) strtol(argv[6], NULL, 10);
-    pDelay = (float) strtod(argv[7], NULL);
-    seedDelay = (int) strtol(argv[8], NULL, 10);
-    int MSS = (int) strtol(argv[9], NULL, 10);
-    int window = (int) strtol(argv[10], NULL, 10);
-    int timeout = (int) strtol(argv[11], NULL, 10);
+	//读取文件，计算文件长度，读入 data
+	FILE *input = fopen(file, "r");
+	fseek(input, 0, SEEK_END);
+	int dataRst = (int)ftell(input);
+	rewind(input);
+	__uint8_t *data = malloc(dataRst);
+	fread(data, 1, dataRst, input);
+	fclose(input);
 
-    //读取文件，计算文件长度，读入 all_data
-    FILE *fp = fopen(file, "r");
-    fseek(fp, 0, SEEK_END);
-    int data_len = (int) ftell(fp);
-    rewind(fp);
-    unsigned char *all_data = malloc(data_len);
-    fread(all_data, 1, data_len, fp);
-    fclose(fp);
+	// unAck 用于储存固定窗口的包
+	STPVO **unAck = calloc(window, sizeof(STPVO *));
+	int unAckN = 0;
 
-    //buffer 用于储存固定窗口的包
-    struct stp_vo **unAcked = malloc(sizeof(struct stp_vo *) * window);
-    int unAcked_pos = 0;
+	//超时相关
+	int SRTT = timeout;
+	int DRTT = 0;
+	int RTO = timeout;
 
-    //超时相关
-    int SRTT = timeout;
-    int DevRTT = 0;
-    int RTO = timeout;
-    int retry = 0;
+	//初始化 socket
+	int seqBase = rand() % 32768;
+	int dataSent = 0;
+	STPInit();
+	STPAddr(ip, port);
+	srand(time(0));
+	STPVO *vo = NULL;
 
-    //初始化 socket
-    int seq_base = 121;
-    int seq_num = seq_base;
-    stp_init();
-    stp_set_addr(ip, port);
-    int established = 0;
+	while (1) {
+		//建立连接
+		STPSend(seqBase, 1, 0, 0, 0, NULL, 0);
+		if ((vo = STPRecv(0, RTO)) && vo->packet.ACK &&
+		    vo->packet.num == seqBase + 1) {
+			free(vo);
+			seqBase++;
+			break;
+		}
+		free(vo);
+	}
 
-    //开始发送
-    while (1) {
+	vo = NULL;
 
-        //建立连接
-        while (!established) {
+	while (unAckN != 0 || dataRst > 0) {
+		//发送数据
+		if (unAckN == 0) {
+			//上一窗口已传输完毕，发送此窗口所有的数据
+			while (unAckN < window && dataRst > 0) {
+				int dataSize = min(dataRst, MSS);
+				unAck[unAckN++] =
+				    STPSend(dataSent + seqBase, 0, 0, 0,
+					    dataSize, data + dataSent, 0);
+				dataSent += dataSize;
+				dataRst -= dataSize;
+			}
+		}
 
-            //发送 SYN
-            stp_send_empty_pkt(seq_num, 1, 0, 0, 0);
-            retry++;
+		//尝试接收包并遍历 unAck
+		free(vo);
+		vo = STPRecv(0, 0);
+		int pos;
+		for (pos = 0; pos < window; pos++) {
+			if (!unAck[pos])
+				continue;
+			if (vo && vo->packet.ACK &&
+			    unAck[pos]->packet.num + unAck[pos]->dataSize ==
+				vo->packet.num) {
+				//如果此包已被确认
+				if (!unAck[pos]->packet.RET) {
+					//不是重传包，更新 RTO，Jacobson-Karels
+					int RTT = vo->oTime - unAck[pos]->oTime;
+					SRTT = SRTT + (RTT - SRTT) / 8;
+					DRTT = (3 * DRTT + abs(RTT - SRTT)) / 4;
+					RTO = max(SRTT + DRTT * 4, 10);
+				}
 
-            //尝试接收数据
-            if (stp_select(RTO << (retry > 3 ? 3 : retry))) {
-                struct stp_vo *pkt = stp_recv();
-                retry = 0;
+				//删除对应的数据包，释放内存
+				free(unAck[pos]);
+				unAck[pos] = NULL;
+				free(vo);
+				vo = NULL;
+				unAckN--;
+			} else if (nowTime() - unAck[pos]->oTime >= RTO) {
+				//如果此包超时，重传
+				unAck[pos]->packet.RET = 1;
+				STPSendVO(unAck[pos], 0);
+			}
+		}
+	}
 
-                //收到 ACK
-                if (pkt->packet.ACK && pkt->packet.num == seq_num + 1) {
-                    free(pkt);
-                    seq_num++;
-                    seq_base++;
-                    established = 1;
-                }
-            }
-        }
+	//发送完毕，释放内存
+	free(data);
+	free(unAck);
 
-        //传送数据
-        while (seq_num - seq_base < data_len) {
+	int retry = 0;
+	while (retry++ < 5) {
+		//发送 FIN，最多重试 5 次
+		STPSend(seqBase + dataSent, 0, 0, 1, 0, NULL, 0);
+		//尝试接收 ACK
+		if ((vo = STPRecv(0, RTO)) && vo->packet.ACK &&
+		    vo->packet.num == seqBase + dataSent + 1)
+			break;
+		free(vo);
+		vo = NULL;
+	}
 
-            //这是一个发送窗口内的事件
-
-            //发送此窗口所有的数据
-            while (unAcked_pos < window && seq_num - seq_base < data_len) {
-                int rest_data = data_len - seq_num + seq_base;
-                int data_split_len = rest_data < MSS ? rest_data : MSS;
-
-                //数据打包
-                struct stp_packet packet = {seq_num, 0, 0, 0, 0};
-                struct stp_vo *pkt = malloc(sizeof(struct stp_vo) + data_split_len);
-                pkt->dataSize = data_split_len;
-                pkt->packet = packet;
-                memcpy(pkt->packet.data, all_data + seq_num - seq_base, data_split_len);
-
-                //发送并添加至 buffer，等待被确认
-                unAcked[unAcked_pos++] = pkt;
-                stp_pld_send(pkt, 0);
-                seq_num += data_split_len;
-            }
-
-            //尝试接收数据
-            while (unAcked_pos > 0) {
-                if (stp_select(0)) {
-                    struct stp_vo *pkt = stp_recv();
-                    retry = 0;
-
-                    //接收到确认包，从 buffer 中找到对应的数据包
-                    int pos;
-                    for (pos = unAcked_pos - 1; pos >= 0; pos--)
-                        if (unAcked[pos]->packet.num + unAcked[pos]->dataSize == pkt->packet.num)
-                            break;
-
-                    if (pkt->packet.ACK && pos >= 0) {
-
-                        //删除对应的数据包
-                        struct stp_vo *o_pkt = unAcked[pos];
-                        int i;
-                        for (i = pos; i < unAcked_pos - 1; i++)
-                            unAcked[i] = unAcked[i + 1];
-                        unAcked_pos--;
-
-                        //更新超时时间，Jacobson / Karels 算法
-                        if (!o_pkt->packet.RET) {
-                            int RTT = (int) (pkt->oTime - o_pkt->oTime);
-                            SRTT = SRTT + ((RTT - SRTT) >> 3);
-                            DevRTT = (3 * DevRTT + abs(RTT - SRTT)) >> 2;
-                            RTO = (SRTT + (DevRTT << 2)) ?: 1;
-                        }
-
-                        //释放内存
-                        free(o_pkt);
-                        free(pkt);
-                    }
-                }
-
-                //检查超时包并重新发送
-                int pos;
-                for (pos = 0; pos < unAcked_pos; pos++) {
-                    if (nowTime() - unAcked[pos]->oTime >= RTO << (retry > 3 ? 3 : retry)) {
-                        retry++;
-                        unAcked[pos]->packet.RET = 1;
-                        stp_pld_send(unAcked[pos], 0);
-                    }
-                }
-            }
-        }
-
-        //发送完毕，释放内存
-        free(all_data);
-        free(unAcked);
-
-        //发送 FIN，最多重试 5 次
-        retry = 0;
-        while (retry < 5) {
-            stp_send_empty_pkt(seq_num, 0, 0, 1, 0);
-            retry++;
-
-            //尝试接收数据
-            if (stp_select(RTO << (retry > 3 ? 3 : retry))) {
-                struct stp_vo *pkt = stp_recv();
-
-                //收到 ACK
-                if (pkt->packet.ACK && pkt->packet.num == seq_num + 1) {
-                    free(pkt);
-                    break;
-                }
-
-                free(pkt);
-            }
-        }
-
-        //关闭 socket，结束循环
-        stp_close();
-        break;
-    }
+	//关闭 socket，结束循环
+	free(vo);
+	STPClose();
 }
